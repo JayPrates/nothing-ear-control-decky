@@ -16,6 +16,7 @@ import json
 import os
 import re
 import select
+import shutil
 import socket
 import struct
 import subprocess
@@ -375,15 +376,19 @@ def rfcomm_channel(mac, service_uuid):
 
 # ---------- bluetoothctl
 
-def run(cmd, timeout=10):
+def system_env():
     # Decky's backend is a PyInstaller bundle; give system tools their own libraries back.
     env = dict(os.environ)
     if "LD_LIBRARY_PATH_ORIG" in env:
         env["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH_ORIG"]
     else:
         env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def run(cmd, timeout=10):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env).stdout
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=system_env()).stdout
     except (OSError, subprocess.SubprocessError) as e:
         decky.logger.warning("%s failed: %s", cmd, e)
         return ""
@@ -427,6 +432,43 @@ def paired_devices():
         result.append({"address": mac, "name": info.get("Alias") or name, "connected": info.get("Connected") == "yes"})
     result.sort(key=lambda d: (not is_nothing_name(d["name"]), not d["connected"], d["name"].lower()))
     return result
+
+
+# ---------- BlueZ change notifications (instead of polling bluetoothctl)
+
+# Matched on BlueZ's object paths rather than sender='org.bluez': signals carry the unique bus name, and
+# whether a monitor resolves well-known sender names depends on the bus implementation.
+BLUEZ_MATCH = ("type='signal',path_namespace='/org/bluez',interface='org.freedesktop.DBus.Properties',"
+               "member='PropertiesChanged',arg0='org.bluez.Device1'")
+
+
+def bluez_monitor_cmd():
+    # Watching the system bus needs root, which the plugin has (the "_root" flag).
+    # stdbuf makes busctl write each event as it happens instead of buffering output to the pipe.
+    cmd = ["busctl", "--system", "--json=short", "monitor", "--match=" + BLUEZ_MATCH]
+    return (["stdbuf", "-oL"] if shutil.which("stdbuf") else []) + cmd
+
+
+def parse_bluez_signal(line):
+    """One `busctl --json=short monitor` line -> (mac, {property: value}) for a Device1 change, else None."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(msg, dict) or msg.get("member") != "PropertiesChanged":
+        return None
+    m = re.search(r"/dev_([0-9A-Fa-f]{2}(?:_[0-9A-Fa-f]{2}){5})$", msg.get("path") or "")
+    data = (msg.get("payload") or {}).get("data")
+    if not m or not isinstance(data, list) or len(data) < 2 or data[0] != "org.bluez.Device1" or not isinstance(data[1], dict):
+        return None
+    props = {k: (v.get("data") if isinstance(v, dict) and "data" in v else v) for k, v in data[1].items()}
+    return m.group(1).replace("_", ":").upper(), props
+
+
+# How long to wait before retrying a failed automatic connect, and how often to check when busctl isn't available.
+RETRY_DELAYS = (15, 30, 60, 120)
+POLL_FALLBACK = 30
+SETTLE_DELAY = 2
 
 
 # ------------------------------------------------------------------ Session
@@ -540,12 +582,23 @@ class Plugin:
         self.paired_cache = []
         self.paired_time = -1e9
         self._reset_state()
-        self.monitor = self.loop.create_task(self._monitor())
+        self.stopping = threading.Event()
+        self.watcher = None
+        self.monitor = self.loop.create_task(self._battery_timer())
+        threading.Thread(target=self._watch_bluez, name="bluez-watch", daemon=True).start()
+        self.loop.create_task(self._auto_connect())   # earbuds that were already connected before the plugin loaded
         decky.logger.info("Nothing Ear Control backend started")
 
     async def _unload(self):
+        self.stopping.set()
         if getattr(self, "monitor", None):
             self.monitor.cancel()
+        watcher = getattr(self, "watcher", None)
+        if watcher is not None:
+            try:
+                watcher.terminate()
+            except OSError:
+                pass
         self._close_session()
 
     async def _uninstall(self):
@@ -760,7 +813,8 @@ class Plugin:
             self.paired_time = time.monotonic()
         return self.paired_cache
 
-    # Connects by itself as soon as Nothing / CMF earbuds (or the last used device) are connected to this machine.
+    # Connects by itself to Nothing / CMF earbuds (or the last used device) that are connected to this machine.
+    # Runs when BlueZ reports a connection, at startup and when the panel opens; nothing polls while idle.
     # A failed attempt (e.g. still in the case) is retried after 15 s, 30 s, 60 s, then every 2 minutes.
     async def _auto_connect(self, now=False):
         if self.session is not None or self.state["connecting"]:
@@ -782,25 +836,61 @@ class Plugin:
             if await self._connect(mac, auto=True):
                 self.retry.pop(mac, None)
             else:
-                self.retry[mac] = (count + 1, time.monotonic() + ((15, 30, 60)[count] if count < 3 else 120))
+                delay = RETRY_DELAYS[min(count, len(RETRY_DELAYS) - 1)]
+                self.retry[mac] = (count + 1, time.monotonic() + delay)
+                self.loop.call_later(delay, self._spawn_auto_connect)
             return
 
-    # Battery every minute while connected; otherwise look for earbuds to connect to.
-    async def _monitor(self):
-        tick = 0
-        while True:
-            await asyncio.sleep(5)
-            tick += 1
+    def _spawn_auto_connect(self, now=False):
+        self.loop.create_task(self._auto_connect(now))
+
+    # From the BlueZ watcher, on the event loop.
+    def _on_bluez(self, mac, props):
+        if mac not in [d["address"] for d in self.paired_cache]:
+            self.paired_time = -1e9   # a device we haven't listed yet (just paired)
+        if props.get("Connected") is False:
+            self.suppressed.discard(mac)
+            self.retry.pop(mac, None)
+        elif props.get("Connected") is True or props.get("ServicesResolved") is True:
+            # Let the earbuds finish setting up audio before opening the control channel.
+            self.loop.call_later(SETTLE_DELAY, self._spawn_auto_connect, True)
+
+    # Runs `busctl monitor` for BlueZ device changes; if it's missing or stops, checks every 30 s until it's back.
+    def _watch_bluez(self):
+        warned = False
+        while not self.stopping.is_set():
+            problem = None
             try:
-                if self.session is not None:
-                    if tick % 12 == 0:
-                        self._send(GET_BATTERY)
-                    continue
-                await self._auto_connect()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                decky.logger.warning("monitor: %s", e)
+                proc = subprocess.Popen(bluez_monitor_cmd(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        text=True, env=system_env())
+            except OSError as e:
+                proc, problem = None, str(e)
+            if proc is not None:
+                self.watcher = proc
+                events = 0
+                for line in proc.stdout:
+                    parsed = parse_bluez_signal(line)
+                    if parsed:
+                        events += 1
+                        self.loop.call_soon_threadsafe(self._on_bluez, *parsed)
+                proc.wait()
+                self.watcher = None
+                if self.stopping.is_set():
+                    return
+                problem = "busctl monitor exited with code %s after %d events" % (proc.returncode, events)
+            if not warned:
+                decky.logger.warning("can't watch BlueZ (%s); checking every %d s instead", problem, POLL_FALLBACK)
+                warned = True
+            # Catch anything missed while not watching.
+            self.loop.call_soon_threadsafe(self._spawn_auto_connect)
+            self.stopping.wait(POLL_FALLBACK)
+
+    # Battery every minute while connected.
+    async def _battery_timer(self):
+        while True:
+            await asyncio.sleep(60)
+            if self.session is not None:
+                self._send(GET_BATTERY)
 
     # ---------- called from the frontend
 
@@ -811,9 +901,9 @@ class Plugin:
     async def list_devices(self):
         return await self._paired(max_age=0)
 
-    # The panel was opened: look for earbuds right away instead of waiting for the next check or retry.
+    # The panel was opened: look for earbuds right away instead of waiting for a retry.
     async def check_now(self):
-        self.loop.create_task(self._auto_connect(now=True))
+        self._spawn_auto_connect(True)
 
     async def connect(self, mac):
         self.suppressed.discard(mac)

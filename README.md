@@ -28,7 +28,8 @@ then in Decky turn on Settings → General → **Developer mode** and use Develo
   service by UUID), then speaks the Nothing protocol over RFCOMM. Battery is refreshed every minute. There's no need
   to press Connect: as soon as paired Nothing/CMF earbuds (or the last used device) connect to the machine, it
   connects to them by itself, retrying if they don't answer yet. After you press Disconnect it leaves them alone
-  until they disconnect and reconnect.
+  until they disconnect and reconnect. It doesn't poll: it listens for BlueZ's change signals with
+  `busctl monitor` (falling back to a check every 30 s if busctl isn't available).
 - `src/index.tsx` (frontend): the panel; polls the backend once a second while open.
 - Logs: Decky's plugin log, plus every frame sent/received in `traffic.log` in the plugin's log folder
   (`~/homebrew/logs/Nothing Ear Control/`).
