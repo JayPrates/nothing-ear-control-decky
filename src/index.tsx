@@ -35,6 +35,7 @@ type State = {
 
 const getState = callable<[], State>("get_state");
 const listDevices = callable<[], Device[]>("list_devices");
+const checkNow = callable<[], void>("check_now");
 const connect = callable<[mac: string], void>("connect");
 const disconnect = callable<[], void>("disconnect");
 const setAnc = callable<[wire: number], void>("set_anc");
@@ -135,6 +136,7 @@ function Content() {
   };
 
   useEffect(() => {
+    checkNow().catch((e) => console.error("Ear Control", e));
     refresh();
     refreshDevices();
     const timer = setInterval(refresh, 1000);
@@ -181,7 +183,7 @@ function Content() {
           </PanelSectionRow>
         )}
         <Note
-          text={s.status || (device ? `Take ${device.name} out of the case, then press Connect.` : "")}
+          text={s.status || (device ? `Ear Control connects by itself when ${device.name} connects to this device. Take them out of the case.` : "")}
           error={s.error}
         />
         <PanelSectionRow>

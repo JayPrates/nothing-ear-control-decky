@@ -535,8 +535,10 @@ class Plugin:
                 self.settings.update(json.load(f))
         except (OSError, ValueError):
             pass
-        self.user_disconnected = False
-        self.was_bt_connected = False
+        self.suppressed = set()      # devices the user disconnected; left alone until they drop off Bluetooth
+        self.retry = {}              # mac -> (failed attempts, monotonic time of the next attempt)
+        self.paired_cache = []
+        self.paired_time = -1e9
         self._reset_state()
         self.monitor = self.loop.create_task(self._monitor())
         decky.logger.info("Nothing Ear Control backend started")
@@ -661,14 +663,15 @@ class Plugin:
             raise OSError(errno.ECONNREFUSED, "no control service")
         return found, Link(mac, BTPROTO_RFCOMM, channel, 10)
 
-    async def _connect(self, mac):
+    async def _connect(self, mac, auto=False):
+        """Returns True once connected."""
         # Only the event loop thread starts connections, so this check-then-set can't race.
         if self.session is not None or self.state["connecting"]:
-            return
+            return False
         with self.lock:
             self.state["connecting"] = True
         name = mac
-        for d in await self.loop.run_in_executor(None, paired_devices):
+        for d in await self._paired(max_age=0):
             if d["address"] == mac:
                 name = d["name"]
         with self.lock:
@@ -679,8 +682,9 @@ class Plugin:
         except Exception as e:
             decky.logger.info("connect failed: %r", e)
             self._reset_state()
-            self._status("Couldn't connect to " + name + ": " + friendly_error(e), True)
-            return
+            self._status("Couldn't connect to " + name + ": " + friendly_error(e) +
+                         (" Trying again automatically." if auto else ""), True)
+            return False
 
         product, base = found if found else (name, None)
         try:
@@ -706,11 +710,10 @@ class Plugin:
             self.settings["last_device"] = mac
             s["lastDevice"] = mac
         self._save_settings()
-        self.user_disconnected = False
-        self.was_bt_connected = True
         self.session.start()
         self._status("Connected to " + name + "." if base else "Connected. Unknown model — showing common controls.")
         await self._query_all()
+        return True
 
     async def _query_all(self):
         with self.lock:
@@ -751,27 +754,49 @@ class Plugin:
         if session is not None:
             session.close()
 
-    # Battery every minute while connected; auto-connect when the last used earbuds connect to the Deck.
+    async def _paired(self, max_age=60):
+        if time.monotonic() - self.paired_time > max_age:
+            self.paired_cache = await self.loop.run_in_executor(None, paired_devices)
+            self.paired_time = time.monotonic()
+        return self.paired_cache
+
+    # Connects by itself as soon as Nothing / CMF earbuds (or the last used device) are connected to this machine.
+    # A failed attempt (e.g. still in the case) is retried after 15 s, 30 s, 60 s, then every 2 minutes.
+    async def _auto_connect(self, now=False):
+        if self.session is not None or self.state["connecting"]:
+            return
+        last = self.settings.get("last_device")
+        candidates = [d["address"] for d in await self._paired() if is_nothing_name(d["name"]) or d["address"] == last]
+        candidates.sort(key=lambda mac: mac != last)
+        for mac in candidates:
+            info = await self.loop.run_in_executor(None, device_info, mac)
+            if info.get("Connected") != "yes":
+                self.suppressed.discard(mac)
+                self.retry.pop(mac, None)
+                continue
+            if mac in self.suppressed:
+                continue
+            count, due = self.retry.get(mac, (0, 0))
+            if not now and time.monotonic() < due:
+                continue
+            if await self._connect(mac, auto=True):
+                self.retry.pop(mac, None)
+            else:
+                self.retry[mac] = (count + 1, time.monotonic() + ((15, 30, 60)[count] if count < 3 else 120))
+            return
+
+    # Battery every minute while connected; otherwise look for earbuds to connect to.
     async def _monitor(self):
         tick = 0
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
             tick += 1
             try:
                 if self.session is not None:
-                    if tick % 6 == 0:
+                    if tick % 12 == 0:
                         self._send(GET_BATTERY)
                     continue
-                mac = self.settings.get("last_device")
-                if not mac or self.state["connecting"]:
-                    continue
-                info = await self.loop.run_in_executor(None, device_info, mac)
-                connected = info.get("Connected") == "yes"
-                if connected and not self.was_bt_connected and not self.user_disconnected:
-                    await self._connect(mac)
-                if not connected:
-                    self.user_disconnected = False
-                self.was_bt_connected = connected
+                await self._auto_connect()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -784,15 +809,23 @@ class Plugin:
             return json.loads(json.dumps(self.state))
 
     async def list_devices(self):
-        return await self.loop.run_in_executor(None, paired_devices)
+        return await self._paired(max_age=0)
+
+    # The panel was opened: look for earbuds right away instead of waiting for the next check or retry.
+    async def check_now(self):
+        self.loop.create_task(self._auto_connect(now=True))
 
     async def connect(self, mac):
+        self.suppressed.discard(mac)
         self.loop.create_task(self._connect(mac))
 
     async def disconnect(self):
-        self.user_disconnected = True
+        with self.lock:
+            device = self.state["device"]
+        if device:
+            self.suppressed.add(device["address"])
         self._close_session()
-        self._reset_state("Disconnected.")
+        self._reset_state("Disconnected. Ear Control won't reconnect until the earbuds reconnect to this device.")
 
     async def set_anc(self, wire):
         if self._send(SET_ANC, 0x01, wire, 0x00):

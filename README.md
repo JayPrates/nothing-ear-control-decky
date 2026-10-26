@@ -25,8 +25,10 @@ then in Decky turn on Settings → General → **Developer mode** and use Develo
 
 - `main.py` (backend, runs as root via the `_root` flag): lists paired devices with `bluetoothctl`, finds the
   RFCOMM channel of the Nothing control service with a small SDP client over L2CAP (Linux can't connect to a
-  service by UUID), then speaks the Nothing protocol over RFCOMM. Battery is refreshed every minute; when the
-  last used earbuds connect it connects to them automatically (unless you pressed Disconnect).
+  service by UUID), then speaks the Nothing protocol over RFCOMM. Battery is refreshed every minute. There's no need
+  to press Connect: as soon as paired Nothing/CMF earbuds (or the last used device) connect to the machine, it
+  connects to them by itself, retrying if they don't answer yet. After you press Disconnect it leaves them alone
+  until they disconnect and reconnect.
 - `src/index.tsx` (frontend): the panel; polls the backend once a second while open.
 - Logs: Decky's plugin log, plus every frame sent/received in `traffic.log` in the plugin's log folder
   (`~/homebrew/logs/Nothing Ear Control/`).
