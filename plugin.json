@@ -1,0 +1,11 @@
+{
+  "name": "Nothing Ear Control",
+  "author": "JayPrates",
+  "flags": ["_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["audio", "bluetooth", "root"],
+    "description": "Battery, noise control, EQ, bass, low latency and find-my-earbuds for Nothing and CMF earbuds.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}
