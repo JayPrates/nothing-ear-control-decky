@@ -527,7 +527,7 @@ class Plugin:
         self.loop = asyncio.get_running_loop()
         self.lock = threading.RLock()
         self.session = None
-        self.settings_path = os.path.join(decky.DECKY_SETTINGS_DIR, "settings.json")
+        self.settings_path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
         self.traffic_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "traffic.log")
         self.settings = {"last_device": None, "last_case_level": -1, "last_case_time": 0}
         try:

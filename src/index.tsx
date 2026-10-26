@@ -119,9 +119,16 @@ function Content() {
   const [s, setS] = useState<State | null>(null);
   const [devices, setDevices] = useState<Device[]>([]);
   const [picked, setPicked] = useState<string | null>(null);
+  const [backendError, setBackendError] = useState<string | null>(null);
 
   const refresh = async () => {
-    try { setS(await getState()); } catch (e) { console.error("Ear Control", e); }
+    try {
+      setS(await getState());
+      setBackendError(null);
+    } catch (e) {
+      console.error("Ear Control", e);
+      setBackendError(String(e));
+    }
   };
   const refreshDevices = async () => {
     try { setDevices(await listDevices()); } catch (e) { console.error("Ear Control", e); }
@@ -137,7 +144,16 @@ function Content() {
   // After a command, show the change right away instead of waiting for the next poll.
   const act = async (f: () => Promise<void>) => { await f(); await refresh(); };
 
-  if (!s) return <PanelSection><Note text="Loading…" /></PanelSection>;
+  if (!s) {
+    return (
+      <PanelSection>
+        <Note
+          text={backendError ? "The plugin's backend isn't responding: " + backendError + ". Check ~/homebrew/logs/Nothing Ear Control/." : "Loading…"}
+          error={!!backendError}
+        />
+      </PanelSection>
+    );
+  }
 
   if (!s.connected) {
     const selected = picked ?? (devices.some((d) => d.address === s.lastDevice) ? s.lastDevice : devices[0]?.address ?? null);
